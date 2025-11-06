@@ -1,0 +1,16 @@
+{
+  "name": "coolify-webhook-relay",
+  "version": "1.0.0",
+  "description": "Webhook relay for Coolify - receives GitHub webhooks and forwards to Coolify on private network",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": ["webhook", "relay", "coolify", "github"],
+  "author": "vnglst",
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.18.2"
+  }
+}

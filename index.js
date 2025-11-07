@@ -13,42 +13,107 @@ if (!COOLIFY_WEBHOOK_URL) {
   process.exit(1);
 }
 
+if (!GITHUB_WEBHOOK_SECRET) {
+  console.error('ERROR: GITHUB_WEBHOOK_SECRET environment variable is required');
+  console.error('Webhook signature verification is mandatory for security');
+  process.exit(1);
+}
+
 console.log(`Webhook relay starting...`);
-console.log(`Will forward to: ${COOLIFY_WEBHOOK_URL}`);
-console.log(`Webhook secret: ${GITHUB_WEBHOOK_SECRET ? 'configured' : 'not configured (signatures will not be verified)'}`);
+console.log(`Forwarding configured: yes`);
+console.log(`Webhook secret: configured`);
+
+// Security headers middleware
+app.use((_req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('X-XSS-Protection', '1; mode=block');
+  res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  next();
+});
+
+// Simple rate limiting: track IPs and request counts
+const rateLimitMap = new Map();
+const RATE_LIMIT_WINDOW = 60000; // 1 minute
+const MAX_REQUESTS_PER_WINDOW = 30; // 30 requests per minute
+
+function rateLimit(req, res, next) {
+  const ip = req.ip || req.connection.remoteAddress;
+  const now = Date.now();
+
+  if (!rateLimitMap.has(ip)) {
+    rateLimitMap.set(ip, { count: 1, resetTime: now + RATE_LIMIT_WINDOW });
+    return next();
+  }
+
+  const limitInfo = rateLimitMap.get(ip);
+
+  if (now > limitInfo.resetTime) {
+    // Reset the counter
+    rateLimitMap.set(ip, { count: 1, resetTime: now + RATE_LIMIT_WINDOW });
+    return next();
+  }
+
+  if (limitInfo.count >= MAX_REQUESTS_PER_WINDOW) {
+    console.warn(`Rate limit exceeded for IP: ${ip}`);
+    return res.status(429).json({ error: 'Too many requests' });
+  }
+
+  limitInfo.count++;
+  next();
+}
+
+// Clean up rate limit map periodically
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, info] of rateLimitMap.entries()) {
+    if (now > info.resetTime) {
+      rateLimitMap.delete(ip);
+    }
+  }
+}, RATE_LIMIT_WINDOW);
+
+// Apply rate limiting to all routes
+app.use(rateLimit);
 
 // Parse JSON bodies with raw body for signature verification
+// Limit payload size to 10MB to prevent abuse
 app.use(express.json({
+  limit: '10mb',
   verify: (req, res, buf) => {
     req.rawBody = buf.toString('utf8');
   }
 }));
 
 // Health check endpoint
-app.get('/health', (req, res) => {
+app.get('/health', (_req, res) => {
   res.json({
     status: 'ok',
-    coolifyUrl: COOLIFY_WEBHOOK_URL,
-    hasSecret: !!GITHUB_WEBHOOK_SECRET,
+    configured: true,
   });
 });
 
 // Verify GitHub webhook signature
 function verifyGitHubSignature(payload, signature) {
-  if (!GITHUB_WEBHOOK_SECRET) {
-    console.warn('Warning: No webhook secret configured, skipping signature verification');
-    return true;
-  }
-
   if (!signature) {
     console.error('No signature provided in request');
+    return false;
+  }
+
+  if (!signature.startsWith('sha256=')) {
+    console.error('Invalid signature format');
     return false;
   }
 
   const hmac = crypto.createHmac('sha256', GITHUB_WEBHOOK_SECRET);
   const digest = 'sha256=' + hmac.update(payload).digest('hex');
 
-  return crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(digest));
+  try {
+    return crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(digest));
+  } catch (error) {
+    console.error('Signature comparison failed:', error.message);
+    return false;
+  }
 }
 
 // GitHub webhook endpoint
@@ -57,23 +122,34 @@ app.post('/webhook/github', async (req, res) => {
   const event = req.headers['x-github-event'];
   const delivery = req.headers['x-github-delivery'];
 
+  // Validate required headers
+  if (!event || !delivery) {
+    console.error('Missing required GitHub headers');
+    return res.status(400).json({ error: 'Invalid webhook request' });
+  }
+
+  // Validate content type
+  const contentType = req.headers['content-type'];
+  if (!contentType || !contentType.includes('application/json')) {
+    console.error('Invalid content type');
+    return res.status(400).json({ error: 'Content-Type must be application/json' });
+  }
+
   console.log(`Received GitHub webhook:`);
   console.log(`  Event: ${event}`);
   console.log(`  Delivery ID: ${delivery}`);
 
-  // Verify signature if secret is configured
-  if (GITHUB_WEBHOOK_SECRET) {
-    const payload = req.rawBody || JSON.stringify(req.body);
-    if (!verifyGitHubSignature(payload, signature)) {
-      console.error('Signature verification failed!');
-      return res.status(401).json({ error: 'Invalid signature' });
-    }
-    console.log('  Signature: verified ✓');
+  // Verify signature (mandatory)
+  const payload = req.rawBody || JSON.stringify(req.body);
+  if (!verifyGitHubSignature(payload, signature)) {
+    console.error('Signature verification failed!');
+    return res.status(401).json({ error: 'Unauthorized' });
   }
+  console.log('  Signature: verified ✓');
 
   // Forward to Coolify
   try {
-    console.log(`Forwarding to Coolify: ${COOLIFY_WEBHOOK_URL}`);
+    console.log(`Forwarding webhook to destination`);
 
     // Forward all GitHub headers to Coolify
     const forwardHeaders = {};
@@ -90,43 +166,31 @@ app.post('/webhook/github', async (req, res) => {
       body: req.rawBody || JSON.stringify(req.body),
     });
 
-    const responseText = await response.text();
-    console.log(`Coolify response: ${response.status} ${response.statusText}`);
-    console.log(`Coolify body: ${responseText.substring(0, 200)}`);
+    console.log(`Destination response: ${response.status}`);
 
     if (!response.ok) {
-      console.error(`Coolify error: ${responseText}`);
+      console.error(`Destination returned error status: ${response.status}`);
       return res.status(502).json({
-        error: 'Coolify webhook failed',
-        status: response.status,
-        message: responseText.substring(0, 500),
+        error: 'Gateway error',
       });
     }
 
     res.status(200).json({
       success: true,
-      message: 'Webhook forwarded to Coolify',
-      coolifyStatus: response.status,
-      coolifyResponse: responseText.substring(0, 200),
     });
   } catch (error) {
     console.error('Error forwarding webhook:', error.message);
     res.status(500).json({
-      error: 'Failed to forward webhook',
-      message: error.message,
+      error: 'Internal server error',
     });
   }
 });
 
 // Root endpoint
-app.get('/', (req, res) => {
+app.get('/', (_req, res) => {
   res.json({
-    service: 'Coolify Webhook Relay',
+    service: 'Webhook Relay',
     version: '1.0.0',
-    endpoints: {
-      health: '/health',
-      webhook: '/webhook/github',
-    },
   });
 });
 

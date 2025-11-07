@@ -75,36 +75,39 @@ app.post('/webhook/github', async (req, res) => {
   try {
     console.log(`Forwarding to Coolify: ${COOLIFY_WEBHOOK_URL}`);
 
+    // Forward all GitHub headers to Coolify
+    const forwardHeaders = {};
+    Object.keys(req.headers).forEach(key => {
+      if (key.startsWith('x-github-') || key.startsWith('x-hub-') || key === 'user-agent') {
+        forwardHeaders[key] = req.headers[key];
+      }
+    });
+    forwardHeaders['content-type'] = 'application/json';
+
     const response = await fetch(COOLIFY_WEBHOOK_URL, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-GitHub-Event': event,
-        'X-GitHub-Delivery': delivery,
-        'X-Hub-Signature-256': signature || '',
-      },
-      body: JSON.stringify(req.body),
+      headers: forwardHeaders,
+      body: req.rawBody || JSON.stringify(req.body),
     });
 
+    const responseText = await response.text();
     console.log(`Coolify response: ${response.status} ${response.statusText}`);
+    console.log(`Coolify body: ${responseText.substring(0, 200)}`);
 
     if (!response.ok) {
-      const text = await response.text();
-      console.error(`Coolify error: ${text}`);
+      console.error(`Coolify error: ${responseText}`);
       return res.status(502).json({
         error: 'Coolify webhook failed',
         status: response.status,
-        message: text,
+        message: responseText.substring(0, 500),
       });
     }
-
-    const result = await response.text();
-    console.log(`Coolify result: ${result}`);
 
     res.status(200).json({
       success: true,
       message: 'Webhook forwarded to Coolify',
       coolifyStatus: response.status,
+      coolifyResponse: responseText.substring(0, 200),
     });
   } catch (error) {
     console.error('Error forwarding webhook:', error.message);

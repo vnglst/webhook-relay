@@ -17,8 +17,12 @@ console.log(`Webhook relay starting...`);
 console.log(`Will forward to: ${COOLIFY_WEBHOOK_URL}`);
 console.log(`Webhook secret: ${GITHUB_WEBHOOK_SECRET ? 'configured' : 'not configured (signatures will not be verified)'}`);
 
-// Parse JSON bodies
-app.use(express.json());
+// Parse JSON bodies with raw body for signature verification
+app.use(express.json({
+  verify: (req, res, buf) => {
+    req.rawBody = buf.toString('utf8');
+  }
+}));
 
 // Health check endpoint
 app.get('/health', (req, res) => {
@@ -59,7 +63,7 @@ app.post('/webhook/github', async (req, res) => {
 
   // Verify signature if secret is configured
   if (GITHUB_WEBHOOK_SECRET) {
-    const payload = JSON.stringify(req.body);
+    const payload = req.rawBody || JSON.stringify(req.body);
     if (!verifyGitHubSignature(payload, signature)) {
       console.error('Signature verification failed!');
       return res.status(401).json({ error: 'Invalid signature' });
